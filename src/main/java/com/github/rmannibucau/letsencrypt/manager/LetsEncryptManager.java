@@ -1,7 +1,9 @@
 package com.github.rmannibucau.letsencrypt.manager;
 
 import static java.util.Arrays.asList;
+import static java.util.Locale.ENGLISH;
 import static java.util.Optional.ofNullable;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import java.io.File;
 import java.io.FileReader;
@@ -12,9 +14,15 @@ import java.net.URI;
 import java.security.KeyPair;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
+import javax.management.ObjectName;
 import javax.servlet.ServletContextEvent;
 import javax.servlet.ServletContextListener;
+import javax.servlet.annotation.WebListener;
 
 import org.shredzone.acme4j.Authorization;
 import org.shredzone.acme4j.Certificate;
@@ -30,6 +38,7 @@ import org.shredzone.acme4j.util.CSRBuilder;
 import org.shredzone.acme4j.util.CertificateUtils;
 import org.shredzone.acme4j.util.KeyPairUtils;
 
+@WebListener
 public class LetsEncryptManager implements ServletContextListener {
 
     private Runnable shutdown;
@@ -48,19 +57,48 @@ public class LetsEncryptManager implements ServletContextListener {
         final int keySize = Integer.getInteger("letsencrypt.key_size", 2048);
         final Collection<String> domains = asList(
                 System.getProperty("letsencrypt.domains", sce.getServletContext().getServletContextName()).split(","));
+        final String restartBehavior = System.getProperty("letsencrypt.restart", "noop");
+        final long delay = Long.getLong("letsencrypt.delay", TimeUnit.MINUTES.toMillis(5));
+
+        sce.getServletContext().log("Starting Let's Encrypt updater with configuration:\n" +
+                "    user key file: " + userKey.getAbsolutePath() + "\n" +
+                "  domain key file: " + domainKey.getAbsolutePath() + "\n" +
+                "domain chain file: " + domainChain.getAbsolutePath() + "\n" +
+                "         key size: " + keySize + "\n" +
+                "          domains: " + domains + "\n" +
+                " restart behavior: " + restartBehavior + "\n" +
+                "     update delay: " + delay + "\n");
+
+        final Runnable restart;
+        switch (restartBehavior.toLowerCase(ENGLISH)) {
+        case "noop":
+            restart = () -> sce.getServletContext().log("Updated Let's Encrypt certificate, you need to reload the certificate");
+            break;
+        case "restart":
+            // idea is to grab system properties catalina.base/home and relaunch the process after having shut down current one
+            throw new UnsupportedOperationException("Auto restart not yet implemented");
+        case "jmx":
+            throw new UnsupportedOperationException("Tomcat doesn't support yet certificate reloading of certificates");
+        case "exit":
+        default:
+            restart = () -> System.exit(0);
+        }
 
         final Runnable update = () -> {
             try {
                 final KeyPair userKeyPair = loadOrCreateKeyPair(keySize, userKey);
                 final Session session = new Session("acme://letsencrypt.org/staging", userKeyPair);
                 final Registration reg = findOrRegisterAccount(session);
-                domains.forEach(d -> {
+                final boolean updated = domains.stream().map(d -> {
                     try {
-                        authorize(reg, d);
+                        return authorize(reg, d);
                     } catch (final IOException | AcmeException e) {
                         throw new IllegalStateException(e);
                     }
-                });
+                }).reduce(false, (previous, val) -> previous || val);
+                if (!updated) {
+                    return;
+                }
 
                 final KeyPair domainKeyPair = loadOrCreateKeyPair(keySize, domainKey);
                 final CSRBuilder csrb = new CSRBuilder();
@@ -82,11 +120,28 @@ public class LetsEncryptManager implements ServletContextListener {
                 sce.getServletContext().log(ioe.getMessage(), ioe);
             }
 
-            // restart if changed
+            restart.run();
         };
 
-        shutdown = () -> {
+        final ScheduledExecutorService pool = Executors.newScheduledThreadPool(1, r -> {
+            final Thread thread = new Thread(r, "letsencrypt-" + sce.getServletContext().getServletContextName() + "-"
+                    + sce.getServletContext().getContextPath().replace("/", ""));
+            if (!thread.isDaemon()) {
+                thread.setDaemon(true);
+            }
+            if (thread.getPriority() != Thread.NORM_PRIORITY) {
+                thread.setPriority(Thread.NORM_PRIORITY);
+            }
+            return thread;
+        });
+        final ScheduledFuture<?> updateFuture = pool.scheduleWithFixedDelay(update, delay, delay, MILLISECONDS);
 
+        shutdown = () -> {
+            try {
+                updateFuture.cancel(true);
+            } finally {
+                pool.shutdown();
+            }
         };
     }
 
@@ -123,11 +178,11 @@ public class LetsEncryptManager implements ServletContextListener {
         return reg;
     }
 
-    private void authorize(final Registration reg, final String domain) throws AcmeException, IOException {
+    private boolean authorize(final Registration reg, final String domain) throws AcmeException, IOException {
         final Authorization auth = reg.authorizeDomain(domain);
         final Challenge challenge = httpChallenge(auth);
         if (challenge.getStatus() == Status.VALID) {
-            return;
+            return false;
         }
 
         challenge.trigger();
@@ -149,6 +204,7 @@ public class LetsEncryptManager implements ServletContextListener {
         if (challenge.getStatus() != Status.VALID) {
             throw new AcmeException("Failed to pass the challenge for domain " + domain + ", ... Giving up.");
         }
+        return true;
     }
 
     private Challenge httpChallenge(final Authorization auth) throws AcmeException, IOException {
