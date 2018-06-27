@@ -10,32 +10,35 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.Writer;
-import java.net.URI;
+import java.lang.management.ManagementFactory;
 import java.security.KeyPair;
-import java.security.cert.X509Certificate;
 import java.util.Collection;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import javax.management.InstanceNotFoundException;
+import javax.management.MBeanException;
+import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
+import javax.management.ReflectionException;
 import javax.servlet.ServletContextEvent;
 import javax.servlet.ServletContextListener;
 import javax.servlet.annotation.WebListener;
 
+import org.shredzone.acme4j.Account;
+import org.shredzone.acme4j.AccountBuilder;
 import org.shredzone.acme4j.Authorization;
 import org.shredzone.acme4j.Certificate;
-import org.shredzone.acme4j.Registration;
-import org.shredzone.acme4j.RegistrationBuilder;
+import org.shredzone.acme4j.Order;
 import org.shredzone.acme4j.Session;
 import org.shredzone.acme4j.Status;
 import org.shredzone.acme4j.challenge.Challenge;
 import org.shredzone.acme4j.challenge.Http01Challenge;
-import org.shredzone.acme4j.exception.AcmeConflictException;
 import org.shredzone.acme4j.exception.AcmeException;
 import org.shredzone.acme4j.util.CSRBuilder;
-import org.shredzone.acme4j.util.CertificateUtils;
 import org.shredzone.acme4j.util.KeyPairUtils;
 
 @WebListener
@@ -57,7 +60,8 @@ public class LetsEncryptManager implements ServletContextListener {
         final int keySize = Integer.getInteger("letsencrypt.key_size", 2048);
         final Collection<String> domains = asList(
                 System.getProperty("letsencrypt.domains", sce.getServletContext().getServletContextName()).split(","));
-        final String restartBehavior = System.getProperty("letsencrypt.restart", "noop");
+        final String restartBehavior = System.getProperty("letsencrypt.restart", "tomcat-reload");
+        final String restartJmxName = System.getProperty("letsencrypt.restart.jmx.name", "Tomcat:name=\"http-nio-8080\",type=ThreadPool");
         final long delay = Long.getLong("letsencrypt.delay", TimeUnit.MINUTES.toMillis(5));
 
         sce.getServletContext().log("Starting Let's Encrypt updater with configuration:\n" +
@@ -71,50 +75,79 @@ public class LetsEncryptManager implements ServletContextListener {
 
         final Runnable restart;
         switch (restartBehavior.toLowerCase(ENGLISH)) {
-        case "noop":
-            restart = () -> sce.getServletContext().log("Updated Let's Encrypt certificate, you need to reload the certificate");
-            break;
-        case "restart":
-            // idea is to grab system properties catalina.base/home and relaunch the process after having shut down current one
-            throw new UnsupportedOperationException("Auto restart not yet implemented");
-        case "jmx":
-            throw new UnsupportedOperationException("Tomcat doesn't support yet certificate reloading of certificates");
-        case "exit":
-        default:
-            restart = () -> System.exit(0);
+            case "noop":
+                restart = () -> sce.getServletContext().log("Updated Let's Encrypt certificate, you need to reload the certificate");
+                break;
+            case "jmx":
+                // for meecrowave, ensure to run with --tomcat-skip-jmx=false
+                restart = () -> {
+                    try {
+                        final ObjectName name = new ObjectName(restartJmxName);
+                        final MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+                        if (!server.isRegistered(name)) {
+                            throw new IllegalArgumentException("No MBean " + name);
+                        }
+                        server.invoke(name, "reloadSslHostConfigs", new Object[0], new String[0]);
+                    } catch (final MalformedObjectNameException | ReflectionException | InstanceNotFoundException | MBeanException e) {
+                        throw new IllegalArgumentException(e);
+                    }
+                };
+                break;
+            case "exit":
+            default:
+                restart = () -> System.exit(0);
         }
 
         final Runnable update = () -> {
             try {
                 final KeyPair userKeyPair = loadOrCreateKeyPair(keySize, userKey);
-                final Session session = new Session("acme://letsencrypt.org/staging", userKeyPair);
-                final Registration reg = findOrRegisterAccount(session);
-                final boolean updated = domains.stream().map(d -> {
+                final Session session = new Session("acme://letsencrypt.org/staging"); // todo: config
+                final Account account = new AccountBuilder().agreeToTermsOfService().useKeyPair(userKeyPair).create(session);
+
+                final KeyPair domainKeyPair = loadOrCreateKeyPair(keySize, domainKey);
+                final Order order = account.newOrder().domains(domains).create();
+                final boolean updated = order.getAuthorizations().stream().map(authorization -> {
                     try {
-                        return authorize(reg, d);
-                    } catch (final IOException | AcmeException e) {
-                        throw new IllegalStateException(e);
+                        return authorize(authorization);
+                    } catch (final AcmeException | IOException e) {
+                        sce.getServletContext().log(e.getMessage(), e);
+                        return false;
                     }
                 }).reduce(false, (previous, val) -> previous || val);
                 if (!updated) {
                     return;
                 }
 
-                final KeyPair domainKeyPair = loadOrCreateKeyPair(keySize, domainKey);
                 final CSRBuilder csrb = new CSRBuilder();
                 csrb.addDomains(domains);
-
                 csrb.sign(domainKeyPair);
-                try (final Writer out = new FileWriter(domainCsr)) {
-                    csrb.write(out);
+
+                try (final FileWriter fw = new FileWriter(domainCsr)) {
+                    csrb.write(fw);
                 }
 
-                final Certificate certificate = reg.requestCertificate(csrb.getEncoded());
-                final X509Certificate cert = certificate.download();
-                final X509Certificate[] chain = certificate.downloadChain();
+                order.execute(csrb.getEncoded());
 
-                try (final FileWriter fw = new FileWriter(domainChain)) {
-                    CertificateUtils.writeX509CertificateChain(fw, cert, chain);
+                try {
+                    int attempts = 20; // todo: config
+                    while (order.getStatus() != Status.VALID && attempts-- > 0) {
+                        if (order.getStatus() == Status.INVALID) {
+                            throw new AcmeException("Order failed... Giving up.");
+                        }
+                        Thread.sleep(3000L); // todo: config
+                        order.update();
+                    }
+                } catch (InterruptedException ex) {
+                    sce.getServletContext().log("let's encrypt refresh interrupted", ex);
+                    Thread.currentThread().interrupt();
+                }
+
+                final Certificate certificate = order.getCertificate();
+                sce.getServletContext().log("Got new certificate: " + certificate.getLocation() + " for " + domains);
+
+                // Write a combined file containing the certificate and chain.
+                try (FileWriter fw = new FileWriter(domainChain)) {
+                    certificate.writeCertificate(fw);
                 }
             } catch (final IOException | AcmeException ioe) {
                 sce.getServletContext().log(ioe.getMessage(), ioe);
@@ -164,23 +197,11 @@ public class LetsEncryptManager implements ServletContextListener {
         }
     }
 
-    private Registration findOrRegisterAccount(final Session session) throws AcmeException {
-        Registration reg;
-
-        try {
-            reg = new RegistrationBuilder().create(session);
-            final URI agreement = reg.getAgreement();
-            acceptAgreement(reg, agreement);
-        } catch (final AcmeConflictException ex) {
-            reg = Registration.bind(session, ex.getLocation());
+    private boolean authorize(final Authorization authorization) throws AcmeException, IOException {
+        final Challenge challenge = httpChallenge(authorization);
+        if (challenge == null) {
+            throw new AcmeException("No HTTP challenge found");
         }
-
-        return reg;
-    }
-
-    private boolean authorize(final Registration reg, final String domain) throws AcmeException, IOException {
-        final Authorization auth = reg.authorizeDomain(domain);
-        final Challenge challenge = httpChallenge(auth);
         if (challenge.getStatus() == Status.VALID) {
             return false;
         }
@@ -188,13 +209,13 @@ public class LetsEncryptManager implements ServletContextListener {
         challenge.trigger();
 
         try {
-            int attempts = 20;
+            int attempts = 20; // todo: config
             while (challenge.getStatus() != Status.VALID && attempts-- > 0) {
                 if (challenge.getStatus() == Status.INVALID) {
                     throw new AcmeException("Challenge failed... Giving up.");
                 }
 
-                Thread.sleep(3000L);
+                Thread.sleep(3000L); // todo: config
                 challenge.update();
             }
         } catch (final InterruptedException ex) {
@@ -202,7 +223,7 @@ public class LetsEncryptManager implements ServletContextListener {
         }
 
         if (challenge.getStatus() != Status.VALID) {
-            throw new AcmeException("Failed to pass the challenge for domain " + domain + ", ... Giving up.");
+            throw new AcmeException("Failed to pass the challenge for domain " + authorization.getDomain() + ", ... Giving up.");
         }
         return true;
     }
@@ -213,6 +234,7 @@ public class LetsEncryptManager implements ServletContextListener {
             throw new AcmeException("Found no " + Http01Challenge.TYPE + " challenge, don't know what to do...");
         }
 
+        // todo: use a valve?
         final File target = new File(System.getProperty("catalina.base"),
                 "webapps/.well-known/acme-challenge/" + challenge.getToken());
         target.getParentFile().mkdirs();
@@ -221,9 +243,5 @@ public class LetsEncryptManager implements ServletContextListener {
         }
 
         return challenge;
-    }
-
-    private void acceptAgreement(final Registration reg, final URI agreement) throws AcmeException {
-        reg.modify().setAgreement(agreement).commit();
     }
 }
